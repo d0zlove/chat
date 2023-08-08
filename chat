@@ -1,1 +1,400 @@
+#include "animation_system.h"
+#include "..\ragebot\aim.h"
 
+void resolver::initialize(player_t* e, adjust_data* record, const float& goal_feet_yaw, const float& pitch)
+{
+	player = e;
+	player_record = record;
+
+	original_goal_feet_yaw = math::normalize_yaw(goal_feet_yaw);
+	original_pitch = math::normalize_pitch(pitch);
+}
+
+void resolver::initialize_yaw(player_t* e, adjust_data* record)
+{
+	player = e;
+
+	player_record = record;
+
+	player_record->left = b_yaw(player, player->m_angEyeAngles().y, 1);
+	player_record->right = b_yaw(player, player->m_angEyeAngles().y, 2);
+	player_record->middle = b_yaw(player, player->m_angEyeAngles().y, 3);
+}
+
+
+void resolver::reset()
+{
+	player = nullptr;
+	player_record = nullptr;
+
+	side = false;
+	fake = false;
+
+	original_goal_feet_yaw = 0.0f;
+	original_pitch = 0.0f;
+}
+
+
+
+void resolver::instance(player_t* e, adjust_data lag_record, bool moved) {
+	if (moved) {
+		resolve_moves(e, lag_record,moved);
+		setup_resolver_layers(e, lag_record, lag_record.m_rotation_mode);
+	}
+	else{
+		resolve_stand(e, lag_record);
+		set_abs_angles_and_bones(e, lag_record.m_rotation_mode);
+	}
+
+	if (!lag_record.m_rotation_mode) {
+		if (g_ctx.globals.missed_shots[e->EntIndex()] > 1)
+		{
+			auto new_rotation = ROTATE_SERVER;
+
+			switch (lag_record.m_rotation_mode)
+			{
+			case ROTATE_LEFT: new_rotation = ROTATE_RIGHT;
+				break;
+			case ROTATE_RIGHT: new_rotation = ROTATE_LOW_RIGHT;
+				break;
+			case ROTATE_LOW_RIGHT: new_rotation = ROTATE_LOW_LEFT;
+				break;
+			case ROTATE_LOW_LEFT: new_rotation = ROTATE_LEFT;
+				break;
+			default: break;
+			}
+
+			lag_record.m_rotation_mode = new_rotation;
+		}
+	}
+}
+
+void resolver::resolve_stand(player_t* player, adjust_data& lag_record)
+{
+	/* get player angle */
+	const auto feet_delta = math::normalize_yaw(math::AngleDiff(math::normalize_yaw(player->m_flLowerBodyYawTarget()), math::normalize_yaw(player->m_angEyeAngles().y)));
+
+	const auto eye_diff = math::AngleDiff(player->m_angEyeAngles().y, player->get_animation_state()->m_flGoalFeetYaw);
+
+	/* the player has just moved from a state of RUNNING to a state of STANDING */
+	auto stopped_moving = player->sequence_activity(lag_record.m_animation_layers.at(ROTATE_SERVER).at(ANIMATION_LAYER_ADJUST).m_nSequence) == ACT_CSGO_IDLE_ADJUST_STOPPEDMOVING;
+
+	/* if player has delta >= 120 (max_desync_delta); */
+	auto balance_adjust = player->sequence_activity(lag_record.m_animation_layers.at(ROTATE_SERVER).at(ANIMATION_LAYER_ADJUST).m_nSequence) == ACT_CSGO_IDLE_TURN_BALANCEADJUST;
+
+	/* a very important thing for rebuild stopped moving
+	 * ref: https://github.com/perilouswithadollarsign/cstrike15_src/blob/f82112a2388b841d72cb62ca48ab1846dfcc11c8/game/shared/cstrike15/csgo_playeranimstate.cpp#L2296
+	 * @note: you can use the logic from there, but only in the other direction, to detect the moves and rebuild something (started_moving_this_frame )
+	*/
+	bool stopped_moving_this_frame = false;
+	if (player->get_animation_state()->flUpVelocity <= 0.1f)
+	{
+		stopped_moving_this_frame = player->get_animation_state()->m_duration_still <= 0;
+		player->get_animation_state()->m_duration_moving = 0.0f;
+		player->get_animation_state()->m_duration_still += player->get_animation_state()->m_last_update_increment;
+	}
+
+	/* rebuild balance adjust
+	 * thanks to my homies llama & valve
+	 * ref: https://github.com/perilouswithadollarsign/cstrike15_src/blob/f82112a2388b841d72cb62ca48ab1846dfcc11c8/game/shared/cstrike15/csgo_playeranimstate.cpp#L2380
+	*/
+	if (player->get_animation_state()->m_ladder_weight == 0.0f && player->get_animation_state()->m_land_anim_multiplier == 0.0f && player->get_animation_state()->m_last_update_increment > 0.0f)
+	{
+		const auto current_feet_yaw = player->get_animation_state()->m_flEyeYaw;
+		const auto goal_feet_yaw = player->get_animation_state()->m_flGoalFeetYaw;
+		auto eye_delta = current_feet_yaw - goal_feet_yaw;
+
+		if (goal_feet_yaw < current_feet_yaw)
+		{
+			if (eye_delta >= 180.0f)
+				eye_delta -= 360.0f;
+		}
+		else if (eye_delta <= -180.0f)
+			eye_delta += 360.0f;
+
+		if (eye_delta / player->get_animation_state()->m_last_update_increment > 120.f)
+		{
+			lag_record.m_animation_layers.at(ROTATE_SERVER).at(ANIMATION_LAYER_ADJUST).m_flCycle =
+				0.0f;
+			lag_record.m_animation_layers.at(ROTATE_SERVER).at(ANIMATION_LAYER_ADJUST).m_flWeight =
+				0.0f;
+
+			balance_adjust = true;
+			player->get_animation_state()->m_adjust_started = true;
+		}
+	}
+
+	/* rebuild stopped moving
+	 * ref: https://github.com/perilouswithadollarsign/cstrike15_src/blob/f82112a2388b841d72cb62ca48ab1846dfcc11c8/game/shared/cstrike15/csgo_playeranimstate.cpp#L2302
+	*/
+	if (!player->get_animation_state()->m_adjust_started && stopped_moving_this_frame && player->get_animation_state()->m_bOnGround && player->get_animation_state()->m_ladder_weight == 0.0f && player->get_animation_state()->m_land_anim_multiplier == 0.0f  /*!landing & !ladder logic*/ && player->get_animation_state()->m_stutter_step < 50.0f)
+	{
+		stopped_moving = true;
+		player->get_animation_state()->m_adjust_started = true;
+	}
+
+	/* just find our side if player meets all three conditions */
+	if (stopped_moving || balance_adjust || player->get_animation_state()->m_adjust_started)
+	{
+		/* detect side */
+		lag_record.m_rotation_mode = feet_delta > 0.0f && eye_diff > 0.0f ? ROTATE_LEFT : ROTATE_RIGHT;
+
+		/* store value for logging */
+		lag_record.m_feet_delta = feet_delta;
+
+		/* update lby
+		 * ref: https://prnt.sc/26jm7xs | https://github.com/perilouswithadollarsign/cstrike15_src/blob/f82112a2388b841d72cb62ca48ab1846dfcc11c8/game/shared/cstrike15/csgo_playeranimstate.cpp#L2353
+		*/
+		player->get_animation_state()->m_flGoalFeetYaw = math::ApproachAngle(player->m_flLowerBodyYawTarget(), player->get_animation_state()->m_flGoalFeetYaw, player->get_animation_state()->m_last_update_increment * 100.0f);
+	}
+
+	/* if rotation mode != server -> push rotation mode to last brute side */
+	fl_stored_brute[player->EntIndex()] = lag_record.m_rotation_mode;
+}
+
+//z = m_velocity
+//xy = flUpVelocity
+
+void resolver::resolve_moves(player_t* player,adjust_data& lag_record,bool moved)
+{
+	if (const auto eye_diff = math::normalize_yaw(math::AngleDiff(player->m_angEyeAngles().y, player->get_animation_state()->m_flGoalFeetYaw)); eye_diff > player->get_max_desync_delta())
+	{
+		lag_record.m_rotation_mode = ROTATE_LOW_RIGHT;
+	}
+	else
+	{
+		if (player->get_min_desync_delta() > eye_diff)
+			lag_record.m_rotation_mode = ROTATE_LOW_LEFT;
+	}
+
+	player->get_animation_state()->m_flGoalFeetYaw = math::ApproachAngle(player->m_angEyeAngles().y, player->get_animation_state()->m_flGoalFeetYaw, (player->get_animation_state()->m_walk_to_run_transition * 20.0f + 30.0f) * player->get_animation_state()->m_last_update_increment);
+}
+
+void resolver::setup_resolver_layers(player_t* player, adjust_data& lag_record, const int32_t rotation_mode)
+{
+	switch (rotation_mode)
+	{
+	case ROTATE_SERVER:
+	{
+		memcpy(lag_record.m_resolver_layers.at(S_SERVER).data(), player->get_animlayers(),
+			sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
+	}
+	break;
+	case ROTATE_LEFT:
+	case ROTATE_LOW_LEFT:
+	{
+		memcpy(lag_record.m_resolver_layers.at(S_LEFT).data(), player->get_animlayers(),
+			sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
+	}
+	break;
+	case ROTATE_RIGHT:
+	case ROTATE_LOW_RIGHT:
+	{
+		memcpy(lag_record.m_resolver_layers.at(S_RIGHT).data(), player->get_animlayers(),
+			sizeof(AnimationLayer) * ANIMATION_LAYER_COUNT);
+	}
+	break;
+	default: {
+	}
+		   break;
+	}
+}
+
+void resolver::set_abs_angles_and_bones(player_t* player, const int32_t rotation_mode)
+{
+	switch (rotation_mode)
+	{
+	case ROTATE_LEFT:
+	{
+		player->get_animation_state()->m_flGoalFeetYaw = math::normalize_yaw(player->m_angEyeAngles().y + player->get_min_desync_delta());
+	}
+	break;
+	case ROTATE_RIGHT:
+	{
+		player->get_animation_state()->m_flGoalFeetYaw = math::normalize_yaw(player->m_angEyeAngles().y - player->get_max_desync_delta());
+	}
+	break;
+	default:
+		break;
+	}
+
+	return player->invalidate_physics_recursive(ANGLES_CHANGED);
+}
+
+
+float resolver::b_yaw(player_t* player, float angle, int n)
+{
+
+	auto animState = player->get_animation_state();
+
+	Vector velocity = player->m_vecVelocity();
+	float spd = velocity.LengthSqr();
+	if (spd > std::powf(1.2f * 260.0f, 2.f)) {
+		Vector velocity_normalized = velocity.Normalized();
+		velocity = velocity_normalized * (1.2f * 260.0f);
+
+
+	}
+
+	float Resolveyaw = animState->m_flGoalFeetYaw;
+
+	auto delta_time
+		= fmaxf(m_globals()->m_curtime - animState->m_flLastClientSideAnimationUpdateTime, 0.f);
+
+	float deltatime = fabs(delta_time);
+	float stop_to_full_running_fraction = 0.f;
+	bool is_standing = true;
+	float v25 = std::clamp(player->m_flDuckAmount() + animState->m_fLandingDuckAdditiveSomething, 0.0f, 1.0f);
+	float v26 = animState->m_fDuckAmount;
+	float v27 = deltatime * 6.0f;
+	float v28;
+
+	// clamp
+	if ((v25 - v26) <= v27) {
+		if (-v27 <= (v25 - v26))
+			v28 = v25;
+		else
+			v28 = v26 - v27;
+	}
+	else {
+		v28 = v26 + v27;
+	}
+
+	float flDuckAmount = std::clamp(v28, 0.0f, 1.0f);
+
+	Vector animationVelocity = velocity;
+	float speed = std::fminf(animationVelocity.Length(), 260.0f);
+
+	auto weapon = player->m_hActiveWeapon().Get();
+
+
+	auto wpndata = weapon->get_csweapon_info();
+
+
+	float flMaxMovementSpeed = 260.0f;
+	if (weapon) {
+		flMaxMovementSpeed = std::fmaxf(wpndata->flMaxPlayerSpeed, 0.001f);
+	}
+
+	float flRunningSpeed = speed / (flMaxMovementSpeed * 0.520f);
+	float flDuckingSpeed_2 = speed / (flMaxMovementSpeed * 0.340f);
+
+	flRunningSpeed = std::clamp(flRunningSpeed, 0.0f, 1.0f);
+
+	float flYawModifier = (((stop_to_full_running_fraction * -0.3f) - 0.2f) * flRunningSpeed) + 1.0f;
+	if (flDuckAmount > 0.0f) {
+		float flDuckingSpeed = std::clamp(flDuckingSpeed_2, 0.0f, 1.0f);
+		flYawModifier += (flDuckAmount * flDuckingSpeed) * (0.5f - flYawModifier);
+	}
+
+	float flMaxBodyYaw = 58.f * flYawModifier;
+	float flMinBodyYaw = -58.f * flYawModifier;
+
+
+	//float flMaxBodyYaw = (*(float*)(uintptr_t(animState) + 0x338) * flYawModifier);
+		//float flMinBodyYaw = (*(float*)(uintptr_t(animState) + 0x334) * flYawModifier);
+
+	float flEyeYaw = player->m_angEyeAngles().y;
+
+	float flEyeDiff = std::remainderf(flEyeYaw - Resolveyaw, 360.f);
+
+	if (flEyeDiff <= flMaxBodyYaw) {
+		if (flMinBodyYaw > flEyeDiff)
+			Resolveyaw = fabs(flMinBodyYaw) + flEyeYaw;
+	}
+	else {
+		Resolveyaw = flEyeYaw - fabs(flMaxBodyYaw);
+	}
+
+	if (speed > 0.1f || fabs(velocity.z) > 100.0f) {
+		Resolveyaw = math::ApproachAngle(
+			flEyeYaw,
+			Resolveyaw,
+			((stop_to_full_running_fraction * 20.0f) + 30.0f)
+			* deltatime);
+	}
+	else {
+		Resolveyaw = math::ApproachAngle(
+			player->m_flLowerBodyYawTarget(),
+			Resolveyaw,
+			deltatime * 100.0f);
+	}
+
+	if (stop_to_full_running_fraction > 0.0 && stop_to_full_running_fraction < 1.0)
+	{
+		const auto interval = m_globals()->m_intervalpertick * 2.f;
+
+		if (is_standing)
+			stop_to_full_running_fraction = stop_to_full_running_fraction - interval;
+		else
+			stop_to_full_running_fraction = interval + stop_to_full_running_fraction;
+
+		stop_to_full_running_fraction = std::clamp(stop_to_full_running_fraction, 0.f, 1.f);
+	}
+
+	if (speed > 135.2f && is_standing)
+	{
+		stop_to_full_running_fraction = fmaxf(stop_to_full_running_fraction, .0099999998f);
+		is_standing = false;
+	}
+
+	if (speed < 135.2f && !is_standing)
+	{
+		stop_to_full_running_fraction = fminf(stop_to_full_running_fraction, .99000001f);
+		is_standing = true;
+	}
+
+	//float Left = flEyeYaw + flMinBodyYaw;
+	//float Right = flEyeYaw + flMaxBodyYaw;
+	float gfy = Resolveyaw;
+	//brute_yaw = std::remainderf(brute_yaw, 360.f);
+
+	if (n == 1)
+		return flMinBodyYaw;
+	else if (n == 2)
+		return flMaxBodyYaw;
+	else if (n == 3)
+		return flEyeYaw;
+
+	if (n == 4)
+	{
+		return speed;
+	}// get player speed
+
+}
+
+
+
+float resolver::resolve_pitch(player_t* e)
+{
+
+	e->get_animation_state()->eyePitch = math::NormalizeAngle(e->get_animation_state()->eyePitch + e->m_flThirdpersonRecoil());
+	e->get_animation_state()->m_flPitch = math::NormalizeAngle(e->get_animation_state()->eyePitch);
+
+	float m_flEyePitch = math::NormalizeAngle(e->get_animation_state()->eyePitch);
+
+	float flPitch = math::AngleDiff(m_flEyePitch, 0);
+
+	float flPitchIdleMin = e->GetAnySequenceAnimTag(e->m_nSequence(), ANIMTAG_AIMLIMIT_PITCHMIN_IDLE, CSGO_ANIM_AIMMATRIX_DEFAULT_PITCH_MIN);
+	float flPitchIdleMax = e->GetAnySequenceAnimTag(e->m_nSequence(), ANIMTAG_AIMLIMIT_PITCHMAX_IDLE, CSGO_ANIM_AIMMATRIX_DEFAULT_PITCH_MAX);
+	float flPitchWalkRunMin = e->GetAnySequenceAnimTag(e->m_nSequence(), ANIMTAG_AIMLIMIT_PITCHMIN_WALKRUN, flPitchIdleMin);
+	float flPitchWalkRunMax = e->GetAnySequenceAnimTag(e->m_nSequence(), ANIMTAG_AIMLIMIT_PITCHMAX_WALKRUN, flPitchIdleMax);
+	float flPitchCrouchMin = e->GetAnySequenceAnimTag(e->m_nSequence(), ANIMTAG_AIMLIMIT_PITCHMIN_CROUCH, CSGO_ANIM_AIMMATRIX_DEFAULT_PITCH_MIN);
+	float flPitchCrouchMax = e->GetAnySequenceAnimTag(e->m_nSequence(), ANIMTAG_AIMLIMIT_PITCHMAX_CROUCH, CSGO_ANIM_AIMMATRIX_DEFAULT_PITCH_MAX);
+	float flPitchCrouchWalkMin = e->GetAnySequenceAnimTag(e->m_nSequence(), ANIMTAG_AIMLIMIT_PITCHMIN_CROUCHWALK, flPitchCrouchMin);
+	float flPitchCrouchWalkMax = e->GetAnySequenceAnimTag(e->m_nSequence(), ANIMTAG_AIMLIMIT_PITCHMAX_CROUCHWALK, flPitchCrouchMax);
+
+	e->get_animation_state()->m_flAimPitchMin = math::lerp(e->get_animation_state()->m_fDuckAmount, math::lerp(e->get_animation_state()->m_flStopToFullRunningFraction, flPitchIdleMin, flPitchWalkRunMin), math::lerp(e->get_animation_state()->m_flFeetSpeedForwardsOrSideWays, flPitchCrouchMin, flPitchCrouchWalkMin));
+	e->get_animation_state()->m_flAimPitchMax = math::lerp(e->get_animation_state()->m_fDuckAmount, math::lerp(e->get_animation_state()->m_flStopToFullRunningFraction, flPitchIdleMax, flPitchWalkRunMax), math::lerp(e->get_animation_state()->m_flFeetSpeedForwardsOrSideWays, flPitchCrouchMax, flPitchCrouchWalkMax));
+
+	if (flPitch > 0)
+	{
+		flPitch = (flPitch / e->get_animation_state()->m_flAimPitchMax) * CSGO_ANIM_AIMMATRIX_DEFAULT_PITCH_MAX;
+	}
+	else
+	{
+		flPitch = (flPitch / e->get_animation_state()->m_flAimPitchMin) * CSGO_ANIM_AIMMATRIX_DEFAULT_PITCH_MIN;
+	}
+
+	return flPitch;
+}
